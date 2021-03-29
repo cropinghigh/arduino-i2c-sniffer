@@ -1,0 +1,189 @@
+.include "m328def.inc"
+;Fclk = 16 000 000 Hz
+
+;IIC Sniffer
+;PORTD2 - SCL
+;PORTD3 - SDA
+
+;PC protocol:
+;UART 115200 B/s
+;2 bytes
+
+;First 1abcdefg
+;abc:
+;000 - Sniffer startup
+;001 - Lines up
+;010 - Start bit
+;011 - Byte transfer
+;100 - Stop bit
+;d - ACK/NACK when byte transfer
+;e,f - not used
+;g - 8th bit of byte when byte transfer
+
+;Second abcdefg1
+;abcdefg - 1-7 bits of byte when byte transfer
+
+;Author: cropinghigh with the assistance of LD, 2021
+;Assemblied by tavrasm
+
+.dseg
+                                .org 0x100
+UARTRingbuffer:                 .byte  256                                      ; YL-readpointer, R19-writepointer
+
+.cseg
+                                rjmp Start
+                                .org UDREaddr
+                                rjmp UDREInterrupt
+
+Start:                          ldi YL, 0
+                                ldi R19, 0
+                                cbi DDRD, 2                                     ; Set lines to input mode
+                                cbi DDRD, 3
+                                ldi YH, high(UARTRingbuffer)                    ; Good buffer address, so XH,YH static
+                                ldi XH, high(UARTRingbuffer)
+                                ldi R16, 1 << U2X0                              ; Init UART at 115200 baud/s
+                                sts UCSR0A, R16
+                                ldi R16, (1 << TXEN0) | (1 << UDRIE0)
+                                sts UCSR0B, R16
+                                ldi R16, (3<<UCSZ00)
+                                sts UCSR0C, R16
+                                ldi R16, high(16)
+                                sts UBRR0H, R16
+                                ldi R16, low(16)
+                                sts UBRR0L, R16
+                                sei
+
+                                ldi R21, 0b10000000
+                                ldi R22, 0b00000001
+                                rcall writeToUartBuff                           ; Send 'Sniffer startup' Packet
+
+                                rcall waitForLinesUp
+_restart:                       rcall waitForStart
+_mainLoop:                      rcall startOrStopOrByte
+                                brts _restart
+                                rjmp _mainloop
+
+; Write R22;R21 to UART buffer with CE detection, overflows not predicted!
+writeToUartBuff:                mov XL, R19
+                                sbic PIND, 4
+                                ori R21, 0b00000100                             ; Set CE status
+                                st X, R21
+                                inc XL
+                                cp XL, YL
+                                breq _buff_full
+                                st X, R22
+                                inc XL
+                                cp XL, YL
+                                breq _buff_full
+                                mov R19, XL
+                                lds R16, UCSR0B                                 ; Allow UART UDR Empty interrupt
+                                sbr R16, (1 << UDRIE0)
+                                sts UCSR0B, R16
+_buff_full:                     ret
+
+
+;R15, R23, Y only for interrupt
+UDREInterrupt:                  in R15, SREG
+                                cp R19, YL
+                                breq _buff_empty
+                                ld R23, Y
+                                sts UDR0, R23
+                                inc YL
+                                rjmp _end
+_buff_empty:                    lds R23, UCSR0B                                 ; Block UART UDR Empty interrupt
+                                cbr R23, (1 << UDRIE0)
+                                sts UCSR0B, R23
+_end:                           out SREG, R15
+                                reti
+
+;Wait for both SDA and SCL to get high
+waitForLinesUp:                 in R16, PIND
+                                andi R16, 0b00001100
+                                cpi R16, 0b00001100
+                                brne waitforLinesUp
+                                ldi R21, 0b10010000                             ; Send 'Lines up' packet
+                                ldi R22, 0b00000001
+                                rcall writeToUartBuff
+                                ret
+
+waitForStart:                   in R16, PIND
+                                andi R16, 0b00001100
+                                cpi R16, 0b00000100                             ; Wait for SDA=0,SCL=1
+                                brne waitForStart
+_loopA:                         in R16, PIND
+                                andi R16, 0b00001100
+                                cpi R16, 0b00000000                             ; Wait for SDA=0,SCL=0
+                                brne _loopA
+                                ldi R21, 0b10100000                             ; Send 'Start bit' packet
+                                ldi R22, 0b00000001
+                                rcall writeToUartBuff
+                                ret
+
+; Receive start bit, or stop bit, or byte. If stop, flag T set up
+startOrStopOrByte:
+_waitScl1:                      sbis PIND, 2                                    ; Wait for SCL up
+                                rjmp _waitScl1
+                                sbis PIND, 3                                    ; Check SDA state
+                                rjmp _sdaLow
+
+_sdaHigh:                       sbis PIND, 2                                    ; Sda high, it may be start or byte with first 1
+                                rjmp _bytefirst1                                ; If scl goes down, its byte with first bit 1
+                                sbis PIND, 3
+                                rjmp _start                                     ; If sda goes down, its start bit
+                                rjmp _sdaHigh
+
+_sdaLow:                        sbis PIND, 2                                    ; Sda low, it may be stop bit or byte with first bit 0
+                                rjmp _bytefirst0                                ; If scl goes down, its byte with first bit 0
+                                sbic PIND, 3
+                                rjmp _stop                                      ; If SDA rises, its stop bit
+                                rjmp _sdaLow
+
+_start:                         ldi R21, 0b10100000                             ; Send 'Start bit' packet
+                                ldi R22, 0b00000001
+                                rcall writeToUartBuff
+_waitScl2:                      sbic PIND, 2                                    ; Wait for SCL to go down
+                                rjmp _waitScl2
+                                clt
+                                ret
+
+_stop:                          ldi R21, 0b11000000                             ; Send 'Stop bit' packet
+                                ldi R22, 0b00000001
+                                rcall writeToUartBuff
+                                set
+                                ret
+
+_bytefirst1:                    ldi R17, 1
+                                rjmp _bytestart
+_bytefirst0:                    ldi R17, 0
+
+_bytestart:                     ldi R18, 7                                      ; Receive 7 bits(first already received)
+_byte:                          lsl R17
+_waitScl4:                      sbis PIND, 2                                    ; Wait for high SCL
+                                rjmp _waitScl4
+                                sbic PIND, 3
+                                rjmp _sdaHigh2
+                                rjmp _endbit
+_sdaHigh2:                      ori R17, 0b00000001
+_endbit:                        sbic PIND, 2                                    ; Wait for low SCL
+                                rjmp _endbit
+                                dec R18
+                                brne _byte
+                                                                                ; Receive ACK/NACK
+_waitScl5:                      sbis PIND, 2                                    ; Wait for high SCL
+                                rjmp _waitScl5
+                                sbic PIND, 3
+                                rjmp _sdaHigh3
+                                ldi R21, 0b10111000                             ; Send 'byte' packet + ACK
+                                rjmp _endack
+_sdaHigh3:                      ldi R21, 0b10110000                             ; Send 'byte' packet + NACK
+
+_endack:                        sbic PIND, 2                                    ; Wait for low SCL
+                                rjmp _endack
+                                lsl R17
+                                brcc _endbyte
+                                ori R21, 0b00000001                             ; If 8th bit is 1, send it in first byte
+_endbyte:                       mov R22, R17
+                                ori R22, 0b00000001
+                                rcall writeToUartBuff
+                                clt
+                                ret
